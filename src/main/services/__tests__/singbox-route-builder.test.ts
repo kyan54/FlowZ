@@ -74,6 +74,17 @@ const meshRule = (rc: any, tag: string): any =>
     (r: any) => r.outbound === tag && r.action === 'route' && Array.isArray(r.ip_cidr)
   );
 
+describe('buildRouteConfig — 出口接口自动检测', () => {
+  it.each([
+    ['tun', true],
+    ['systemProxy', false],
+    ['manual', false],
+  ] as const)('%s 模式 → auto_detect_interface=%s', (proxyModeType, expected) => {
+    const rc = buildRouteConfig(cfg([], { proxyModeType }), new Map(), deps([]));
+    expect(rc.auto_detect_interface).toBe(expected);
+  });
+});
+
 describe('buildRouteConfig — D-direct 组网 force-route', () => {
   const node = wgNode('w1', 'WG', ['10.8.0.0/24']);
 

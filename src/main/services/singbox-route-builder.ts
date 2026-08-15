@@ -304,7 +304,11 @@ export function buildRouteConfig(
     // 核心修复：default_domain_resolver 使用 IP-based DoH 引导解析器 (dns-bootstrap)，
     // 既避免解析 doh.pub 域名时的死循环，又免疫 UDP 53 限速/劫持（dns-bootstrap 同为 IP-based）。
     default_domain_resolver: 'dns-bootstrap',
-    auto_detect_interface: true,
+    // TUN 模式必须让内核锁定物理出口，避免 outbound 再被自家 TUN 捕获形成回环。
+    // systemProxy/manual 没有该回环风险，反而必须尊重 OS 的实际路由选择：macOS 上 OpenVPN 等
+    // 常用 0/1 + 128/1 接管流量，同时保留 en0 的 default route；auto_detect_interface 只看 default
+    // 会把 socket 错绑到 en0，而目的地址实际路由指向 utun，最终直接报 network is unreachable。
+    auto_detect_interface: config.proxyModeType === 'tun',
     // 如果模式是全局代理 (global/proxy)，则最终出口是所选节点（经 proxy-selector）；direct 模式或 D4/D7 兜底→direct。
     // 地区分流反向（仅 smart + enabled + reverse，如「回国」）：海外应直连 → final 兜底翻为 direct。
     final:

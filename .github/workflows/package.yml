@@ -3,8 +3,8 @@ name: Package
 # 打包（出安装包）与验证分离：验证在 ci.yml（每个 PR/push 都跑）。本 workflow 只在改动碰打包输入时跑：
 #   - push main 碰打包敏感 paths：完整打包，Windows 上传 artifact。价值：a) 直推 main 的版本/lockfile/内核
 #     bump 没有 PR 冒烟，这里是其唯一打包检查；b) nsis/portable/压缩层 --dir 冒烟测不到，在此 tag 前暴露。
-#     纯 src/UI/docs 提交跳过——不碰打包输入，CI 已验编译，完整打包增量保护≈0；兜底 = 下一个
-#     build-input push 或 tag（release.yml）。
+#     src 提交也触发——main 上的运行时修复应自动产出可安装的 Windows artifact，并在 macOS 完整走一次打包链；
+#     docs-only 提交仍跳过。正式三平台发布仍由 tag（release.yml）负责。
 #   - PR 碰打包敏感 paths：只跑 `electron-builder --dir` 冒烟（验证 helper 编译/资产 fetch/asar 组装/extraResources 布局），
 #     不出安装包、不上传。
 #   - workflow_dispatch：手动取包逃生舱（替代「从 PR 拿包」），任意 commit 需要安装包时手动触发。
@@ -25,6 +25,7 @@ on:
       - 'helper/**'
       - 'helper-win/**'
       - 'helper-linux/**'
+      - 'src/**'
       - 'src/shared/core-manifest.json'
       - '.github/workflows/**'
       - 'build/**'
@@ -40,6 +41,7 @@ on:
       - 'helper/**'
       - 'helper-win/**'
       - 'helper-linux/**'
+      - 'src/**'
       - 'src/shared/core-manifest.json'
       - '.github/workflows/**'
       - 'build/**'
