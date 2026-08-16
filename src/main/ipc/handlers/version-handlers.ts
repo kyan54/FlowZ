@@ -46,7 +46,7 @@ export function registerVersionHandlers(coreUpdateService?: CoreUpdateService): 
         buildDate: BUILD_DATE,
         singBoxVersion: currentSingBoxVersion,
         copyright: `© ${new Date().getFullYear()} FlowZ. All rights reserved.`,
-        repositoryUrl: 'https://github.com/dododook/FlowZ',
+        repositoryUrl: 'https://github.com/kyan54/FlowZ',
         platform: process.platform,
         arch: process.arch,
         osVersion: release(),

@@ -40,7 +40,8 @@ import { mt, getMainLanguage } from '../i18n';
 // 防永久挂起致更新永不 resolve（进度窗/对话框永久转圈）。正常下载持续有 data、不断重置、不会误触发。
 const DOWNLOAD_IDLE_TIMEOUT_MS = 30_000;
 
-const GITHUB_OWNER = 'dododook';
+// 营联定制版使用独立 Release 序列，避免 `x.y.z-yl.n` 被上游同基线正式版覆盖更新。
+const GITHUB_OWNER = 'kyan54';
 const GITHUB_REPO = 'FlowZ';
 
 /**

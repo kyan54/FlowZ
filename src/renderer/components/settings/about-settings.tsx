@@ -173,23 +173,20 @@ export function AboutSettings() {
   };
 
   const handleOpenGitHub = async () => {
-    const url = versionInfo?.repositoryUrl || 'https://github.com/dododook/FlowZ';
+    const url = versionInfo?.repositoryUrl || 'https://github.com/kyan54/FlowZ';
     await openExternal(url);
   };
 
   // 打开 GitHub 新建 issue 页，正文已自动带上版本/系统/架构/内核/代理模式，报告者只需补问题描述与日志。
   const handleReportIssue = async () => {
-    const url = buildBugReportUrl(
-      versionInfo?.repositoryUrl || 'https://github.com/dododook/FlowZ',
-      {
-        appVersion: versionInfo?.appVersion,
-        platform: versionInfo?.platform,
-        arch: versionInfo?.arch,
-        osVersion: versionInfo?.osVersion,
-        singBoxVersion: versionInfo?.singBoxVersion,
-        proxyModeType,
-      }
-    );
+    const url = buildBugReportUrl(versionInfo?.repositoryUrl || 'https://github.com/kyan54/FlowZ', {
+      appVersion: versionInfo?.appVersion,
+      platform: versionInfo?.platform,
+      arch: versionInfo?.arch,
+      osVersion: versionInfo?.osVersion,
+      singBoxVersion: versionInfo?.singBoxVersion,
+      proxyModeType,
+    });
     await openExternal(url);
   };
 

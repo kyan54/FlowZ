@@ -76,7 +76,7 @@ const meshRule = (rc: any, tag: string): any =>
 
 describe('buildRouteConfig — 出口接口自动检测', () => {
   it.each([
-    ['tun', true],
+    ['tun', process.platform !== 'darwin'],
     ['systemProxy', false],
     ['manual', false],
   ] as const)('%s 模式 → auto_detect_interface=%s', (proxyModeType, expected) => {

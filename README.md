@@ -2,17 +2,35 @@
 
 <img src="docs/banner.png" width="100%" alt="FlowZ — 简洁现代的跨平台代理客户端，基于 sing-box，所见即所得" />
 
-[![release](https://img.shields.io/github/v/release/dododook/FlowZ?style=flat-square&color=0E98A4&label=release)](https://github.com/dododook/FlowZ/releases)
+[![release](https://img.shields.io/github/v/release/kyan54/FlowZ?style=flat-square&color=0E98A4&label=release)](https://github.com/kyan54/FlowZ/releases)
 [![sing-box](https://img.shields.io/badge/sing--box-1.14-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
 [![platform](https://img.shields.io/badge/platform-Windows%20·%20macOS%20·%20Linux-0E98A4?style=flat-square)](#-安装)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE.txt)
-[![stars](https://img.shields.io/github/stars/dododook/FlowZ?style=flat-square&color=0E98A4)](https://github.com/dododook/FlowZ/stargazers)
+[![stars](https://img.shields.io/github/stars/kyan54/FlowZ?style=flat-square&color=0E98A4)](https://github.com/kyan54/FlowZ/stargazers)
 
 **简体中文** · [English](README.en.md) · [繁體中文](README.zh-TW.md) · [Русский](README.ru.md) · [فارسی](README.fa.md)
 
 </div>
 
 > 原作者开源地址：https://github.com/zhangjh/FlowZ
+
+> 上游项目：https://github.com/dododook/FlowZ
+>
+> 定制维护：**上海营联信息技术有限公司**
+
+## 营联定制版
+
+本仓库是基于 FlowZ 上游版本维护的营联定制发行版。版本号采用
+`<上游版本>-yl.<定制修订号>`：例如上游 `4.3.2` 对应首个定制版本
+`4.3.2-yl.1`；同步到上游 `4.3.3` 后，定制版本从 `4.3.3-yl.1` 重新计数。
+
+当前定制改动：
+
+- 修复 macOS 系统代理 / 手动代理与 OpenVPN、EasyConnect 共存时，sing-box 错绑物理网卡导致的 `network is unreachable`。
+- 修复 macOS TUN 与 OpenVPN 共存时的同类出口冲突，并保留节点 IP 的 TUN 防回环排除。
+- 独立节点测速服从系统实际路由，可通过当前活动 VPN 出口测速。
+- GitHub Actions 在 `src/**` 发生变化并推送到 `main` 后自动执行 CI 和跨平台打包。
+- 保留 VLESS + Reality + XTLS Vision 分享链接的直接导入与配置生成能力。
 
 主打：**配置简单 · 规则明确 · 切换不断流 · 一次授权零提权**。
 
@@ -176,7 +194,7 @@
 
 ## 📥 安装
 
-从 [Releases](https://github.com/dododook/FlowZ/releases) 下载最新版本。
+从 [Releases](https://github.com/kyan54/FlowZ/releases) 下载最新版本。
 
 | 平台 | 安装 |
 |------|------|
@@ -204,7 +222,7 @@ xattr -cr /Applications/FlowZ.app
 ## 🛠 从源码构建
 
 ```bash
-git clone https://github.com/dododook/FlowZ.git
+git clone https://github.com/kyan54/FlowZ.git
 cd FlowZ
 npm install
 
@@ -278,4 +296,4 @@ MIT License
 
 ## ⭐ Star 趋势
 
-[![Star History Chart](https://api.star-history.com/svg?repos=dododook/FlowZ&type=Date)](https://star-history.com/#dododook/FlowZ&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=kyan54/FlowZ&type=Date)](https://star-history.com/#kyan54/FlowZ&Date)
