@@ -38,9 +38,11 @@ import { localProxyPort, controlApiPort } from '../../shared/proxy-ports';
 import { effectiveBypassLan } from '../../shared/system-proxy-bypass';
 import { isDirectSelection, resolveGlobalExitTag } from '../../shared/direct-selection';
 import { parseDefaultGateway, parseScutilRouter } from '../../shared/default-route';
+import { parseMacRouteInterface } from '../../shared/mac-route-interface';
 import {
   isIpv4Host,
   isIpv6Host,
+  effectiveCustomRules,
   effectiveAppRules,
   applyRuleSetPrune,
   buildIdToTagMap,
@@ -323,6 +325,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   // 供 generateDnsConfig 把内网/captive 域名重定向到它（takeover 后 dns-local=公网解不了内网）+ rule C 直连放行防环。
   // null=无可用 LAN 解析器（非 TUN/关/DHCP 读不到/仅公网）→ 退回 dns-local。每次 start 入口重置重读。
   private lanResolverForDns: string | null = null;
+  // macOS TUN 的实际上游接口。启动前按所有会拨号的节点逐一执行 `route -n get <target>`；仅结果一致时设置，
+  // 供 route.default_interface 防自身回环并兼容 OpenVPN/EasyConnect 的 utun 路由。每次 start 重新探测。
+  private tunDefaultInterface: string | null = null;
+  // 与 tunDefaultInterface 同一启动世代的节点目标 IP。macOS 域名节点先解析为 IP 并进入 route_exclude，
+  // route monitor 触发后继续查询这些稳定目标，避免运行中域名 route get 被 FlowZ 自家 TUN 路由截获。
+  private macTunRouteTargets: string[] = [];
   // issue #147：本地节点域名 race DNS server（多上游并发 race）+ 其监听端口。start 路径（race on）起；
   // raceServerPort>0 = race 就绪 → getNodeResolverTag on→dns-node-race + buildDnsConfig 生成该 server；
   // =0（off / 起失败 / snapshot/preflight/未启动路径）→ 降级单上游（生成物逐字节回现状，快照零变化）。
@@ -813,18 +821,20 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 3.1 落盘外化自定义规则文件 + 孤儿对账清扫（必须在 generateSingBoxConfig 前——缺文件 sing-box 启动 FATAL）
     await this.writeCustomRuleFiles(config);
 
-    // 3.5. 预解析所有节点的域名为 IP（仅针对 TUN 模式），防止 Windows 下回流死循环
+    // 3.5. 预解析所有节点的域名为 IP（仅针对 TUN 模式）。Windows 用于防回流；macOS 还用于
+    // route_exclude + VPN 路由热切检测，确保 OpenVPN 重连后查询的是节点 IP 而非被自家 TUN 捕获的域名路由。
     // 【待真机验证 / CDN 风险】：对"域名节点"预解析得到的 IP 会进 route_exclude_address，若节点在
     //   共享 CDN(如 Cloudflare) 后，等于把共享 IP 加直连 → 误伤同 IP 的被墙站点、且抗不住 IP 轮换。
     //   现已在 generateRouteConfig 用"全节点域名 → direct"的纯域名规则(sniff SNI)做 CDN 安全豁免；
     //   此处 Windows IP 预解析是否仍为断环所必需，需 Wintun 真机验证：若域名规则+sniff 足够 → 删除本块；
     //   若 Windows 确需 IP 级兜底 → 应仅对 IP-literal 节点保留、域名节点不预解析。无 Windows 环境暂不擅改。
     const resolvedServerIps: Record<string, string> = {};
-    if (isTunMode && process.platform === 'win32') {
-      this.logToManager('info', '正在预解析节点域名以防止 TUN 回流...');
+    if (isTunMode && (process.platform === 'win32' || process.platform === 'darwin')) {
+      this.logToManager('info', '正在预解析节点域名用于 TUN 防回流与 VPN 路由跟踪...');
       const dns = require('dns').promises;
       const allServerIds = new Set([
         config.selectedServerId as string,
+        ...effectiveCustomRules(config).map((r) => r.targetServerId),
         ...effectiveAppRules(config).map((r) => r.targetServerId),
       ]);
 
@@ -886,6 +896,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 3.9.5 issue #324：收 3.2 发起的地址冲突预检结果（此刻必须落定：地址要随本次配置下发给核）。
     await this.applyTunAddressPreflight(tunAddressPick);
+
+    // 3.9.6 macOS TUN：在自家 TUN 创建前按节点目标解析真实上游接口。OpenVPN 常用 0/1+128/1，
+    // 此时系统 default 仍是 en0，sing-box 的 auto detect 会误绑 en0；route get 目标地址才能得到 utun。
+    this.tunDefaultInterface = await this.resolveMacTunDefaultInterface(config, resolvedServerIps);
 
     // 4. 生成 sing-box 配置文件
     const singboxConfig = this.generateSingBoxConfig(config, resolvedServerIps);
@@ -1101,9 +1115,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     try {
       if (config.proxyModeType === 'tun' && config.dnsConfig?.takeoverSystemDns !== false) {
         await this.systemDnsManager?.setDns();
-        // 接管成功 → 起热插重灌 watcher（探链路变化/唤醒 → 去抖 reconcile 补接管换网/新服务）。仅 darwin 真起，
-        // best-effort：起失败不阻断 TUN 启动（watcher 失效 ≠ 接管失效，已接管服务仍受控）。
-        this.startDnsInterfaceWatcher();
       } else {
         // 非 TUN / 用户关掉接管开关 → 停 watcher（若在）+ 还原可能残留的受控 DNS（覆盖 TUN→其它模式切换、开→关切换）。
         this.stopDnsInterfaceWatcher();
@@ -1115,6 +1126,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         `系统 DNS 接管状态同步失败: ${e instanceof Error ? e.message : String(e)}`
       );
     }
+
+    // macOS TUN 无论是否启用 DNS 接管都监听链路变化：除补灌 DNS 外，还负责 OpenVPN/EasyConnect
+    // 断开/重连后的实际上游接口对账。非 TUN 停止 watcher。
+    if (config.proxyModeType === 'tun') this.startDnsInterfaceWatcher();
+    else this.stopDnsInterfaceWatcher();
 
     // 核已成功起动、DNS 接管状态已收口 → best-effort 刷 OS DNS 缓存（fire-and-forget，不阻塞启动；让位
     // CoreStartSupersededError 与失败路径在更早处已抛、到不了这里）。清掉接管边界前系统解析器缓存的陈旧记录
@@ -3496,6 +3512,71 @@ done
   }
 
   /**
+   * macOS TUN 的上游接口不能只看 `route get default`：OpenVPN/EasyConnect 常用更具体路由接管目标，
+   * 同时保留 en0 default。逐节点查询实际路由，只有所有待拨号节点结果一致才显式绑定；混合出口或探测失败
+   * 回退 auto_detect_interface，避免把部分节点错误钉到另一张网卡。
+   */
+  private async resolveMacTunDefaultInterface(
+    config: UserConfig,
+    resolvedIps?: Record<string, string>
+  ): Promise<string | null> {
+    if (process.platform !== 'darwin' || config.proxyModeType !== 'tun') {
+      this.macTunRouteTargets = [];
+      return null;
+    }
+
+    const ids = new Set<string>();
+    if (config.selectedServerId && !isDirectSelection(config.selectedServerId)) {
+      ids.add(config.selectedServerId);
+    }
+    for (const rule of effectiveCustomRules(config)) {
+      if (rule.targetServerId) ids.add(rule.targetServerId);
+    }
+    for (const rule of effectiveAppRules(config)) {
+      if (rule.targetServerId) ids.add(rule.targetServerId);
+    }
+
+    const targets = Array.from(ids)
+      .map(
+        (id) =>
+          resolvedIps?.[id] ?? config.servers.find((server) => server.id === id)?.address?.trim()
+      )
+      .filter((target): target is string => Boolean(target));
+    if (resolvedIps) this.macTunRouteTargets = Array.from(new Set(targets));
+    const routeTargets = this.macTunRouteTargets;
+    if (routeTargets.length === 0) return null;
+
+    const interfaces = new Set<string>();
+    for (const target of routeTargets) {
+      try {
+        const { stdout } = await healthProbeExecFile('route', ['-n', 'get', target], {
+          timeout: 4000,
+        });
+        const iface = parseMacRouteInterface(stdout);
+        if (!iface) return null;
+        interfaces.add(iface);
+      } catch (error) {
+        this.logToManager(
+          'warn',
+          `macOS TUN 上游接口探测失败(${target})，回退自动检测: ${(error as Error)?.message ?? error}`
+        );
+        return null;
+      }
+    }
+
+    if (interfaces.size !== 1) {
+      this.logToManager(
+        'warn',
+        `macOS TUN 节点分属多个出口接口(${Array.from(interfaces).join(', ')})，回退自动检测`
+      );
+      return null;
+    }
+    const iface = interfaces.values().next().value as string;
+    this.logToManager('info', `macOS TUN 上游接口按节点实际路由选择: ${iface}`);
+    return iface;
+  }
+
+  /**
    * 生成 sing-box 配置（sing-box 1.12.x / 1.13.x 兼容格式）
    */
   generateSingBoxConfig(config: UserConfig, resolvedIps?: Record<string, string>): SingBoxConfig {
@@ -3587,6 +3668,7 @@ done
         },
         // §E.1：race 就绪时把上游 IP 传给 route 做直连放行（防 TUN 回环）；未就绪路径恒 []（零变化）。
         raceUpstreamIps: this.raceServerPort > 0 ? this.raceUpstreamIps : [],
+        defaultInterface: this.tunDefaultInterface ?? undefined,
       }),
       experimental: {
         cache_file: {
@@ -6648,8 +6730,18 @@ rm -f "$STOPFLAG"
         powerMonitor,
         // 去抖后的统一 reconcile 入口：门控镜像 setDns（仅 TUN + 未关接管 + marker 在才动手），否则跳过。
         onTrigger: async () => {
-          if (!shouldReconcileDns(this.currentConfig, mgr.hasMarker())) return;
-          await mgr.reconcileDns();
+          const config = this.currentConfig;
+          if (shouldReconcileDns(config, mgr.hasMarker())) await mgr.reconcileDns();
+          if (!config || config.proxyModeType !== 'tun') return;
+
+          const actualInterface = await this.resolveMacTunDefaultInterface(config);
+          if (!actualInterface || actualInterface === this.tunDefaultInterface) return;
+
+          this.logToManager(
+            'info',
+            `检测到 VPN 上游接口变化: ${this.tunDefaultInterface ?? 'auto'} → ${actualInterface}，自动重连 FlowZ`
+          );
+          this.scheduleDebouncedRestart();
         },
         debounceMs: 1500, // 1.5s：合并插坞站/换网的 RTM_ burst（设计建议 1–2s）。
         schedule: (fn, ms) => setTimeout(fn, ms),
