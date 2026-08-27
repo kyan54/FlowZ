@@ -86,6 +86,12 @@ export type {
   ConnectionEntry,
   ConnectionsSnapshot,
   ConnectionsAggregate,
+  ConnectionHistorySettings,
+  ConnectionHistoryEntry,
+  ConnectionHistoryQuery,
+  ConnectionHistoryQueryResult,
+  ConnectionHistoryGroup,
+  ConnectionHistoryMode,
   ConnectionAggHost,
   ConnectionAggOutbound,
   ConnectionAggFlow,
@@ -529,6 +535,11 @@ export interface UserConfig {
   logLevel: LogLevel;
   // 关闭日志写盘（sing-box log.disabled）；默认 false=写盘。关闭后应用内无法查看实时日志/基于日志的诊断
   disableLogFile?: boolean;
+
+  // 结构化连接历史：默认关（域名/进程路径属隐私数据，用户显式开启才记录）。
+  // 只记连接元数据与流量，按天轮转；保留期限强制收紧到 1/3/7 天。
+  connectionHistoryEnabled?: boolean;
+  connectionHistoryRetentionDays?: 1 | 3 | 7;
 
   // 诊断采集（临时提级）：开启时把 logLevel 临时拉到 debug 复现问题，存档原级别供还原。
   // 存在即「采集中」（UI 据此显示采集条）。结束采集 / 下次启动 app → 还原 logLevel=prevLogLevel 后清此字段。

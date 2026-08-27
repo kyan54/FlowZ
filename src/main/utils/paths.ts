@@ -239,6 +239,11 @@ export function getLogsPath(): string {
   return path.join(getUserDataPath(), 'logs');
 }
 
+/** 可选的结构化连接历史目录（按 UTC 日分 JSONL）。 */
+export function getConnectionHistoryPath(): string {
+  return path.join(getUserDataPath(), 'connection-history');
+}
+
 /**
  * sing-box 官方面板资源缓存目录（dashboard.path）。核首启时若目录为空，从 download_url 拉 zip 解此 + 写 .etag。
  * 改 singboxDashboardUrl 时删此目录使核下次启动重拉；「刷新面板资源」IPC 亦清此目录。

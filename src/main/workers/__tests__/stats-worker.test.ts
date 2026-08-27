@@ -7,6 +7,7 @@
  * 真实实现（要真签名比对）。Date.now 打桩以精确控 rate-cap 窗口。
  */
 import type { ConnectionEntry } from '../../../shared/types';
+import type { ConnectionLifecycleEvent } from '../../services/StatsService';
 
 type Posted = { type: string; payload?: unknown; [k: string]: unknown };
 type ConnSnap = { connections: ConnectionEntry[]; at: number };
@@ -15,6 +16,7 @@ describe('stats-worker (batch2 数据面核心)', () => {
   let posted: Posted[];
   let messageHandler: ((e: { data: unknown }) => void) | null;
   let onConnections: ((snap: ConnSnap) => void) | null;
+  let onLifecycle: ((event: ConnectionLifecycleEvent) => void) | null;
   let statsMethods: {
     resubscribe: jest.Mock;
     stop: jest.Mock;
@@ -23,7 +25,7 @@ describe('stats-worker (batch2 数据面核心)', () => {
   let nowVal: number;
 
   const ENDPOINT = { host: '127.0.0.1', port: 9090, secret: 's', tls: undefined };
-  const CONNECT = { type: 'connect', endpoint: ENDPOINT };
+  const CONNECT = { type: 'connect', endpoint: ENDPOINT, historySessionId: 'session-1' };
 
   // 造一条假连接：host 决定聚合 host 名，chain 决定 outbound（喂真实 aggregateConnections）。
   const conn = (host: string, chain: string): ConnectionEntry =>
@@ -43,12 +45,17 @@ describe('stats-worker (batch2 数据面核心)', () => {
     if (!onConnections) throw new Error('onConnections 未捕获');
     onConnections({ connections, at: nowVal });
   };
+  const fireLifecycle = (event: ConnectionLifecycleEvent): void => {
+    if (!onLifecycle) throw new Error('onLifecycle 未捕获');
+    onLifecycle(event);
+  };
   const postsOf = (type: string): Posted[] => posted.filter((p) => p.type === type);
 
   beforeEach(() => {
     posted = [];
     messageHandler = null;
     onConnections = null;
+    onLifecycle = null;
     nowVal = 10_000_000;
     jest.spyOn(Date, 'now').mockImplementation(() => nowVal);
     statsMethods = {
@@ -67,9 +74,32 @@ describe('stats-worker (batch2 数据面核心)', () => {
 
     jest.resetModules();
     jest.doMock('../../services/StatsService', () => ({
+      trimConnection: (raw: any) => ({
+        id: String(raw.id ?? ''),
+        chains: raw.chainList ?? [],
+        rule: raw.rule ?? '',
+        rulePayload: '',
+        metadata: {
+          host: raw.domain,
+          destinationIP: raw.destination?.split(':')[0],
+          destinationPort: raw.destination?.split(':')[1],
+          network: raw.network,
+          processPath: raw.processInfo?.processPath,
+        },
+        upload: Number(raw.uplinkTotal) || 0,
+        download: Number(raw.downlinkTotal) || 0,
+        start: raw.createdAt ? new Date(Number(raw.createdAt) / 1e6).toISOString() : undefined,
+      }),
       StatsService: jest.fn(
-        (_onStats: unknown, _getClient: unknown, onConn: (s: ConnSnap) => void) => {
+        (
+          _onStats: unknown,
+          _getClient: unknown,
+          onConn: (s: ConnSnap) => void,
+          _visible: unknown,
+          lifecycle: (event: ConnectionLifecycleEvent) => void
+        ) => {
           onConnections = onConn;
+          onLifecycle = lifecycle;
           return statsMethods;
         }
       ),
@@ -127,7 +157,13 @@ describe('stats-worker (batch2 数据面核心)', () => {
     fireConn([conn('a.com', 'P')]);
     expect(postsOf('detail')).toHaveLength(0); // 无需求 → 不跨进程传明细
 
-    send({ type: 'setDemand', connectionsStream: true, detail: true });
+    send({
+      type: 'setDemand',
+      connectionsStream: true,
+      aggregate: false,
+      detail: true,
+      history: false,
+    });
     fireConn([conn('a.com', 'P')]); // 即便同内容（aggregate 不 post），detail 仍每帧 post
     expect(postsOf('detail')).toHaveLength(1);
     const payload = postsOf('detail')[0].payload as ConnSnap;
@@ -139,13 +175,31 @@ describe('stats-worker (batch2 数据面核心)', () => {
     send(CONNECT); // 复位调一次 true
     statsMethods.setConnectionsStreamEnabled.mockClear();
 
-    send({ type: 'setDemand', connectionsStream: false, detail: false }); // true→false
+    send({
+      type: 'setDemand',
+      connectionsStream: false,
+      aggregate: false,
+      detail: false,
+      history: false,
+    }); // true→false
     expect(statsMethods.setConnectionsStreamEnabled).toHaveBeenLastCalledWith(false);
 
-    send({ type: 'setDemand', connectionsStream: false, detail: false }); // 未变 → 不调
+    send({
+      type: 'setDemand',
+      connectionsStream: false,
+      aggregate: false,
+      detail: false,
+      history: false,
+    }); // 未变 → 不调
     expect(statsMethods.setConnectionsStreamEnabled).toHaveBeenCalledTimes(1);
 
-    send({ type: 'setDemand', connectionsStream: true, detail: false }); // false→true
+    send({
+      type: 'setDemand',
+      connectionsStream: true,
+      aggregate: true,
+      detail: false,
+      history: false,
+    }); // false→true
     expect(statsMethods.setConnectionsStreamEnabled).toHaveBeenLastCalledWith(true);
     expect(statsMethods.setConnectionsStreamEnabled).toHaveBeenCalledTimes(2);
   });
@@ -156,5 +210,54 @@ describe('stats-worker (batch2 数据面核心)', () => {
     expect(statsMethods.stop).toHaveBeenCalled();
     expect(postsOf('aggregate')).toHaveLength(0);
     expect(postsOf('detail')).toHaveLength(0);
+  });
+
+  it('history 需求只在 OPENED/CLOSED post 小记录，关闭后停止', () => {
+    send(CONNECT);
+    expect(typeof onLifecycle).toBe('function');
+    send({
+      type: 'setDemand',
+      connectionsStream: true,
+      aggregate: false,
+      detail: false,
+      history: true,
+    });
+    const connection = {
+      id: 'c1',
+      domain: 'example.com',
+      destination: '1.2.3.4:443',
+      outbound: 'US',
+      outboundType: 'vless',
+      chainList: ['US'],
+      createdAt: String(nowVal * 1_000_000),
+    };
+    fireLifecycle({ type: 'OPENED', connection });
+    fireLifecycle({ type: 'OPENED', connection }); // 同 id 重复 NEW 不重记
+    expect(postsOf('history')).toHaveLength(1);
+    expect(postsOf('history')[0].payload).toEqual([
+      expect.objectContaining({
+        key: 'session-1:c1',
+        domain: 'example.com',
+        outbound: 'US',
+        active: true,
+      }),
+    ]);
+
+    fireLifecycle({
+      type: 'CLOSED',
+      connection,
+      closedAt: String((nowVal + 1000) * 1_000_000),
+    });
+    expect(postsOf('history')).toHaveLength(2);
+
+    send({
+      type: 'setDemand',
+      connectionsStream: false,
+      aggregate: false,
+      detail: false,
+      history: false,
+    });
+    fireLifecycle({ type: 'OPENED', connection: { ...connection, id: 'c2' } });
+    expect(postsOf('history')).toHaveLength(2);
   });
 });

@@ -54,6 +54,7 @@ import {
   registerSystemHandlers,
   registerRuleResourceHandlers,
   registerStatsSubscriptionHandlers,
+  registerConnectionHistoryHandlers,
 } from './ipc/handlers';
 import { setIpcLogger, registerIpcHandler } from './ipc/ipc-handler';
 import { createAutoStartManager } from './services/AutoStartManager';
@@ -70,6 +71,7 @@ import {
 } from './services/StatsWorkerHost';
 import { StatsSimulator } from './services/StatsSimulator';
 import { StatsSubscriptionRegistry } from './services/StatsSubscriptionRegistry';
+import { ConnectionHistoryService } from './services/ConnectionHistoryService';
 import { PlatformPrivilegeService } from './services/PlatformPrivilegeService';
 import { IpInfoService } from './services/IpInfoService';
 import { createExitProbeLatencyRunner } from './services/exit-probe-latency';
@@ -1651,6 +1653,13 @@ if (gotTheLock) {
     proxyManager.setPrivilegeService(privilegeService);
     coreUpdateService.setPrivilegeService(privilegeService);
 
+    const connectionHistoryService = new ConnectionHistoryService({
+      isEnabled: () => configManager.get<boolean>('connectionHistoryEnabled') === true,
+      retentionDays: () => configManager.get<number>('connectionHistoryRetentionDays') ?? 1,
+      log: (level, message) => logManager.addLog(level, message, 'ConnectionHistory'),
+    });
+    let lastConnectionHistoryWriteWarnAt = 0;
+
     // 流量统计（T4，issue #225）：StatsService 已拆入 utilityProcess（见 services/StatsWorkerHost + workers/stats-worker）。
     // 本宿主 fork/看护 worker、缓存最新快照、按 isUiBroadcastActive(可见 && !拖动) 门控后 sendToAll——把 Status/
     // Connections 长流的 per-frame 解析+物化移出主线程，消除拖动期事件循环争用。worker 据 getStatsApiEndpoint 重建
@@ -1692,10 +1701,19 @@ if (gotTheLock) {
       onStats: (stats) => statsSubscriptionRegistry.broadcast('stats', stats),
       onAggregate: (agg) => statsSubscriptionRegistry.broadcast('aggregate', agg),
       onDetail: (conns) => statsSubscriptionRegistry.broadcast('detail', conns),
+      onHistory: (entries) => {
+        void connectionHistoryService.append(entries).catch((e) => {
+          const now = Date.now();
+          if (now - lastConnectionHistoryWriteWarnAt < 60_000) return;
+          lastConnectionHistoryWriteWarnAt = now;
+          logManager.addLog('warn', `连接历史写入失败: ${e}`, 'ConnectionHistory');
+        });
+      },
       // relay 安全门（兜底，非 demand 源）：窗口不可见 / Windows 拖动中 → host 只缓存不 relay。
       isUiActive: isUiBroadcastActive,
       // demand 源（取代 isUiActive）：某 topic 是否有渲染端订阅者。
       hasSubscribers: (topic) => statsSubscriptionRegistry.hasSubscribers(topic),
+      isHistoryEnabled: () => configManager.get<boolean>('connectionHistoryEnabled') === true,
       getEndpoint: () => proxyManager?.getStatsApiEndpoint() ?? null,
       log: (level, message) => logManager.addLog(level, message, 'StatsWorker'),
     };
@@ -2069,6 +2087,7 @@ if (gotTheLock) {
     registerProxyHandlers(proxyManager, configManager);
     // §3.7：STATS_SUBSCRIBE/STATS_UNSUBSCRIBE（渲染端 useStatsTopic 声明/撤销 topic 订阅）。
     registerStatsSubscriptionHandlers(statsSubscriptionRegistry);
+    registerConnectionHistoryHandlers(connectionHistoryService, configManager, statsService);
     registerIpInfoHandlers(ipInfoService);
     registerUnlockHandlers(unlockService);
     registerSystemHandlers();

@@ -1,7 +1,9 @@
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/store/app-store';
 import { EyeOff } from 'lucide-react';
 import { ConnectionsTable } from '@/components/connections/connections-table';
+import { ConnectionHistoryTable } from '@/components/connections/connection-history-table';
 import { shouldHideForPrivacy } from '@/components/connections/connection-utils';
 
 /**
@@ -17,12 +19,29 @@ export function ConnectionsPage() {
   const { t } = useTranslation();
   const isPrivacyMode = useAppStore((s) => s.isPrivacyMode);
   const hidden = shouldHideForPrivacy(isPrivacyMode);
+  const [tab, setTab] = useState<'live' | 'history'>('live');
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4" data-page="conns">
       <div className="page-h">
-        <h1>{t('connections.pageTitle')}</h1>
-        <span className="sub">{t('connections.pageDesc')}</span>
+        <div>
+          <h1>{t('connections.pageTitle')}</h1>
+          <span className="sub">{t('connections.pageDesc')}</span>
+        </div>
+        <div className="ms-auto flex rounded-md bg-muted p-1">
+          <button
+            className={`rounded px-3 py-1.5 text-xs transition-colors ${tab === 'live' ? 'bg-card font-medium text-foreground shadow-sm' : 'text-muted-foreground'}`}
+            onClick={() => setTab('live')}
+          >
+            {t('connections.tabLive')}
+          </button>
+          <button
+            className={`rounded px-3 py-1.5 text-xs transition-colors ${tab === 'history' ? 'bg-card font-medium text-foreground shadow-sm' : 'text-muted-foreground'}`}
+            onClick={() => setTab('history')}
+          >
+            {t('connections.tabHistory')}
+          </button>
+        </div>
       </div>
 
       {hidden ? (
@@ -32,8 +51,10 @@ export function ConnectionsPage() {
             {t('connections.privacyHidden')}
           </span>
         </div>
-      ) : (
+      ) : tab === 'live' ? (
         <ConnectionsTable />
+      ) : (
+        <ConnectionHistoryTable />
       )}
     </div>
   );

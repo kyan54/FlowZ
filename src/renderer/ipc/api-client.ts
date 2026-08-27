@@ -22,6 +22,9 @@ import type {
   InvalidNodeInfo,
   ImportParseResult,
   PendingNodeChanges,
+  ConnectionHistorySettings,
+  ConnectionHistoryQuery,
+  ConnectionHistoryQueryResult,
 } from '../../shared/types';
 import type {
   UnlockSnapshot,
@@ -428,6 +431,20 @@ export const connectionsApi = {
   /** 关全部连接（main 经 9090 DELETE /connections，触发 ResetNetwork）。 */
   async closeAll(): Promise<{ ok: boolean }> {
     return ipcClient.invoke(IPC_CHANNELS.CONNECTIONS_CLOSE_ALL);
+  },
+  history: {
+    getSettings(): Promise<ConnectionHistorySettings> {
+      return ipcClient.invoke(IPC_CHANNELS.CONNECTION_HISTORY_GET_SETTINGS);
+    },
+    configure(settings: ConnectionHistorySettings): Promise<ConnectionHistorySettings> {
+      return ipcClient.invoke(IPC_CHANNELS.CONNECTION_HISTORY_CONFIGURE, settings);
+    },
+    query(query: ConnectionHistoryQuery): Promise<ConnectionHistoryQueryResult> {
+      return ipcClient.invoke(IPC_CHANNELS.CONNECTION_HISTORY_QUERY, query);
+    },
+    clear(): Promise<{ ok: boolean }> {
+      return ipcClient.invoke(IPC_CHANNELS.CONNECTION_HISTORY_CLEAR);
+    },
   },
 };
 

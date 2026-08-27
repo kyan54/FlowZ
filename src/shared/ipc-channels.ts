@@ -91,6 +91,10 @@ export const IPC_CHANNELS = {
   STATS_UNSUBSCRIBE: 'stats:unsubscribe', // 退订某 topic（unmount/窗口隐藏/暂停）：无订阅者 → worker 逐级停机
   CONNECTIONS_CLOSE: 'connections:close', // 关单条连接（main 经 9090 DELETE /connections/{id}）
   CONNECTIONS_CLOSE_ALL: 'connections:closeAll', // 关全部连接（main 经 9090 DELETE /connections，触发 ResetNetwork）
+  CONNECTION_HISTORY_GET_SETTINGS: 'connectionHistory:getSettings',
+  CONNECTION_HISTORY_CONFIGURE: 'connectionHistory:configure',
+  CONNECTION_HISTORY_QUERY: 'connectionHistory:query',
+  CONNECTION_HISTORY_CLEAR: 'connectionHistory:clear',
 
   // 出口 IP 信息（本地直连出口 / 代理出口）
   IP_INFO_GET: 'ipinfo:get',

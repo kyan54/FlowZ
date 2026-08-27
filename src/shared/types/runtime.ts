@@ -109,6 +109,75 @@ export interface ConnectionsSnapshot {
   at: number; // 采样时刻 epoch ms
 }
 
+// ============================================================================
+// 连接历史（可选持久化）
+// ============================================================================
+
+export type ConnectionHistoryMode = 'all' | 'proxy' | 'direct';
+
+export interface ConnectionHistorySettings {
+  enabled: boolean;
+  retentionDays: 1 | 3 | 7;
+}
+
+/**
+ * 单条连接的可持久化快照。同 key 会先写 active=true，关闭时再写 active=false；
+ * 查询端按 key 保留最后一条，在不做原地改写的前提下得到最终流量/结束时间。
+ * 不记录 source IP、请求内容、DNS 响应或节点密钥。
+ */
+export interface ConnectionHistoryEntry {
+  key: string;
+  connectionId: string;
+  sessionId: string;
+  startedAt: number;
+  endedAt?: number;
+  observedAt: number;
+  active: boolean;
+  domain?: string;
+  destinationIP?: string;
+  destinationPort?: string;
+  network?: string;
+  processPath?: string;
+  rule?: string;
+  chains: string[];
+  outbound: string;
+  outboundType?: string;
+  upload: number;
+  download: number;
+}
+
+export interface ConnectionHistoryQuery {
+  from: number;
+  to: number;
+  mode?: ConnectionHistoryMode;
+  outbound?: string;
+  search?: string;
+  limit?: number;
+}
+
+/** 历史页按「目标 + 实际出口」聚合的一行。 */
+export interface ConnectionHistoryGroup {
+  destination: string;
+  domain?: string;
+  destinationIP?: string;
+  outbound: string;
+  outboundType?: string;
+  count: number;
+  firstAt: number;
+  lastAt: number;
+  upload: number;
+  download: number;
+  activeCount: number;
+  processes: string[];
+}
+
+export interface ConnectionHistoryQueryResult {
+  groups: ConnectionHistoryGroup[];
+  totalConnections: number;
+  uniqueDestinations: number;
+  truncated: boolean;
+}
+
 /** 拓扑「其它」分组的 sentinel host 名（聚合 Top-N 截断后剩余的合并条目）。渲染端 topology-layout 见此值 →
  *  替换为 i18n 文案 t('home.others')。用控制字符前缀确保绝不与真实 host/IP/rule 名冲突。 */
 export const TOPOLOGY_OTHERS_KEY = '\u0000others';

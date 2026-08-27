@@ -18,3 +18,4 @@ export * from './unlock-handlers';
 export * from './system-handlers';
 export * from './rule-resource-handlers';
 export * from './stats-subscription-handlers';
+export * from './connection-history-handlers';

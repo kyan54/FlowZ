@@ -713,6 +713,20 @@ export class ConfigManager implements IConfigManager {
       }
     }
 
+    // 连接历史包含域名/进程路径，必须显式 true 才开；污染值一律回退关闭。
+    if (
+      config.connectionHistoryEnabled !== undefined &&
+      typeof config.connectionHistoryEnabled !== 'boolean'
+    ) {
+      config.connectionHistoryEnabled = false;
+    }
+    if (
+      config.connectionHistoryRetentionDays !== undefined &&
+      ![1, 3, 7].includes(Number(config.connectionHistoryRetentionDays))
+    ) {
+      config.connectionHistoryRetentionDays = 1;
+    }
+
     // 校验 customRules（新 Rule shape）。**一律告警不 throw**：防单条脏数据触发整配置回落
     // 默认（loadConfig catch 会用默认配置覆盖保存 → 用户规则全丢）。结构非法的规则丢弃，值非法仅告警保留。
     // 单条脏配置可批量出现 → 丢弃/sanitize 事件累计计数，循环结束后各汇总一条，防逐条刷屏。
@@ -1155,6 +1169,8 @@ export class ConfigManager implements IConfigManager {
       minimizeToTray: true,
       autoCheckUpdate: true, // 默认启用启动时自动检查更新
       autoLightweightMode: false, // 默认不启用自动轻量模式
+      connectionHistoryEnabled: false, // 域名/进程属隐私数据；默认不落盘
+      connectionHistoryRetentionDays: 1, // 开启后默认只保留最近 24 小时
       hardwareAcceleration: true, // 图形兼容逃生门：默认开（关闭=opt-in 自救，app ready 前禁硬件加速改软件渲染，见 services/graphics-compat）
       windowEffects: true, // 窗口特效（Win Mica / mac 毛玻璃）默认开；关闭=opt-in 自救，主窗回落实色底
       desktopNotifications: true, // 桌面通知总开关，默认开（仅严重错误事件发通知）

@@ -111,6 +111,12 @@ export function trimConnection(c: SingBoxConnection): ConnectionEntry {
   };
 }
 
+export interface ConnectionLifecycleEvent {
+  type: 'OPENED' | 'CLOSED';
+  connection: SingBoxConnection;
+  closedAt?: string;
+}
+
 export class StatsService {
   // Status 流 stop 句柄（常开，仅核运行期）。null=未订阅。
   private statusStop: (() => void) | null = null;
@@ -147,7 +153,10 @@ export class StatsService {
     private readonly onUpdate: (stats: TrafficStats) => void,
     private readonly getApiClient: () => SingBoxApiClient | null,
     private readonly onConnections?: (snap: ConnectionsSnapshot) => void,
-    private readonly isWindowVisible?: () => boolean
+    private readonly isWindowVisible?: () => boolean,
+    private readonly onConnectionLifecycle?: (event: ConnectionLifecycleEvent) => void,
+    /** history-only 需求仅维护 raw connMap/生命周期，不必每帧物化整张 ConnectionEntry[]。 */
+    private readonly shouldMaterializeConnections?: () => boolean
   ) {}
 
   start(): void {
@@ -342,9 +351,29 @@ export class StatsService {
       const id = ev?.id ?? ev?.connection?.id;
       if (!id) continue;
       switch (ev?.type) {
-        case 'CLOSED':
+        case 'CLOSED': {
+          const existing = this.connMap.get(id) ?? ev.connection;
+          if (existing) {
+            // CLOSED 帧可仍带末段 delta；先合并到副本再发历史终态，不污染已广播引用。
+            const closed: SingBoxConnection = {
+              ...existing,
+              closedAt: ev.closedAt ?? existing.closedAt,
+              uplinkTotal: String(
+                (Number(existing.uplinkTotal) || 0) + (Number(ev.uplinkDelta) || 0)
+              ),
+              downlinkTotal: String(
+                (Number(existing.downlinkTotal) || 0) + (Number(ev.downlinkDelta) || 0)
+              ),
+            };
+            this.emitConnectionLifecycle({
+              type: 'CLOSED',
+              connection: closed,
+              closedAt: ev.closedAt ?? existing.closedAt,
+            });
+          }
           this.connMap.delete(id);
           break;
+        }
         case 'UPDATE': {
           // 实测：UPDATE 帧只带 uplinkDelta/downlinkDelta（connection 为 null）→ 把增量累加到既有条目 totals，
           // 维持连接页 per-connection 实时流量（否则恒显 NEW 时的 0，到 CLOSED 又被删，全程流量为 0=regression）。
@@ -378,6 +407,7 @@ export class StatsService {
           // 故 NEW 丢弃 closedAt>0 条目：只留活连接。附带根治 connMap 死连接单调累积（审计 #3）。
           if (ev?.connection && !(Number(ev.connection.closedAt) > 0)) {
             this.connMap.set(id, ev.connection);
+            this.emitConnectionLifecycle({ type: 'OPENED', connection: ev.connection });
           }
           break;
       }
@@ -392,10 +422,19 @@ export class StatsService {
     // 活动连接数由本流的 connMap.size 维护（Status 的 connectionsIn/Out 核不填 → 首页恒 0 的根因）；在可见性
     // 短路前更新，使下一次 Status onUpdate 广播到的计数恒为真实活跃连接数。
     this.snapshot.activeConnections = this.connMap.size;
+    if (this.shouldMaterializeConnections && !this.shouldMaterializeConnections()) return;
     // 不可见（无 UI 消费者）→ 只维护 connMap、跳过列表物化 + 广播（省每秒对全部连接的全量重建 + splitHostPort，
     // 结果本就被可见性门控丢弃）；可见后下一帧即物化推送。
     if (this.isWindowVisible && !this.isWindowVisible()) return;
     this.connections = Array.from(this.connMap.values()).map(trimConnection);
     this.onConnections?.({ connections: this.connections, at: Date.now() });
+  }
+
+  private emitConnectionLifecycle(event: ConnectionLifecycleEvent): void {
+    try {
+      this.onConnectionLifecycle?.(event);
+    } catch {
+      // 历史是可选观测面；任何异常不能打断 Status/Connections 主流。
+    }
   }
 }

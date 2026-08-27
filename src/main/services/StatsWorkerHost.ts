@@ -14,7 +14,13 @@
  * 两 client 各连同一 127.0.0.1:apiPort 的不同 RPC 流，互不冲突。
  */
 import { utilityProcess, type UtilityProcess } from 'electron';
-import type { TrafficStats, ConnectionsSnapshot, ConnectionsAggregate } from '../../shared/types';
+import { randomUUID } from 'crypto';
+import type {
+  TrafficStats,
+  ConnectionsSnapshot,
+  ConnectionsAggregate,
+  ConnectionHistoryEntry,
+} from '../../shared/types';
 import type { StatsTopic } from '../../shared/ipc-channels';
 
 /** worker 重建 SingBoxApiClient 所需的运行期管理 API 端点（本地恒无 tls）。 */
@@ -52,12 +58,18 @@ export interface StatsHost extends StatsProvider {
 
 /** main → worker 控制消息。 */
 export type HostToWorkerMessage =
-  | { type: 'connect'; endpoint: StatsApiEndpoint }
+  | { type: 'connect'; endpoint: StatsApiEndpoint; historySessionId: string }
   | { type: 'stop' }
   // batch3 §3.7（源从「窗口可见」换成「渲染端订阅」）：需求驱动。connectionsStream=是否订阅上游 SubscribeConnections
-  // （aggregate 或 detail 有订阅者→需拓扑/明细；均无→连上游流一起停，削核 CPU）；detail=明细页有订阅者（true 时
+  // （aggregate/detail/history 任一需求为 true 即开；均无才停）；detail=明细页有订阅者（true 时
   // worker 每帧跨进程传全量明细）。由 registry 订阅变化即时触发 + status 帧惰性重发（reconnect 自愈），见 syncDemand。
-  | { type: 'setDemand'; connectionsStream: boolean; detail: boolean }
+  | {
+      type: 'setDemand';
+      connectionsStream: boolean;
+      aggregate: boolean;
+      detail: boolean;
+      history: boolean;
+    }
   | { type: 'dispose' };
 
 /** worker → main 数据/握手消息。 */
@@ -68,7 +80,9 @@ export type WorkerToHostMessage =
   // aggregate（拓扑供数，杀「每秒全量克隆」B2 + 「零信息增量每秒重渲染」放大器）。
   | { type: 'aggregate'; payload: ConnectionsAggregate }
   // detail=全量明细，仅 detailDemand（连接页 pull 期）才 post，host 缓存供 CONNECTIONS_GET pull（不 relay）。
-  | { type: 'detail'; payload: ConnectionsSnapshot };
+  | { type: 'detail'; payload: ConnectionsSnapshot }
+  // 只在连接 NEW/CLOSED 时传小批量结构化历史，不传每秒全量快照。
+  | { type: 'history'; payload: ConnectionHistoryEntry[] };
 
 const ZERO_STATS: TrafficStats = {
   uploadSpeed: 0,
@@ -92,6 +106,8 @@ export interface StatsWorkerHostOptions {
   onAggregate: (agg: ConnectionsAggregate) => void;
   /** 连接明细 relay（batch3 §3.7：detail 由 pull 改 push topic；经 registry 只发给 'detail' 订阅者；门控后调用）。 */
   onDetail: (conns: ConnectionsSnapshot) => void;
+  /** 连接生命周期小记录落盘入口（不受 UI 可见性门控）。 */
+  onHistory?: (entries: ConnectionHistoryEntry[]) => void;
   /**
    * relay 安全门（belt-and-suspenders）：false（窗口不可见 / Windows 拖动中）时只缓存不 relay。batch3 里订阅本身
    * 已由渲染端 visibility 暂停，此为兜底（订阅在但窗口不可见——如拖动期——仍不发）。**非** demand 源（见 hasSubscribers）。
@@ -102,6 +118,8 @@ export interface StatsWorkerHostOptions {
    * （connectionsStream = aggregate||detail 有订阅；detail = detail 有订阅）。无订阅者 → 逐级停机。
    */
   hasSubscribers: (topic: StatsTopic) => boolean;
+  /** 结构化历史是否开启（每次 syncDemand 求值，配置热切即时生效）。 */
+  isHistoryEnabled?: () => boolean;
   /** 取运行期管理 API 端点（核未起返回 null → worker 不开流）。 */
   getEndpoint: () => StatsApiEndpoint | null;
   /** 可选日志钩子（接 logManager）。 */
@@ -123,7 +141,14 @@ export class StatsWorkerHost implements StatsHost {
   private respawnDelayMs = 500;
   /** 上次下发给 worker 的需求（batch2，取代 lastConnActiveSent）。null=未发过（reconnect/respawn 后重置，
    *  强制下个 status 帧重新下发 setDemand）。仅任一字段变化才重发。 */
-  private lastDemandSent: { connectionsStream: boolean; detail: boolean } | null = null;
+  private lastDemandSent: {
+    connectionsStream: boolean;
+    aggregate: boolean;
+    detail: boolean;
+    history: boolean;
+  } | null = null;
+  /** 同一个核会话稳定；worker respawn 复用，新核 resubscribe 时更换。 */
+  private historySessionId = randomUUID();
 
   constructor(private readonly opts: StatsWorkerHostOptions) {
     this.spawn();
@@ -178,7 +203,7 @@ export class StatsWorkerHost implements StatsHost {
       this.post({ type: 'stop' });
       return;
     }
-    this.post({ type: 'connect', endpoint });
+    this.post({ type: 'connect', endpoint, historySessionId: this.historySessionId });
   }
 
   /**
@@ -190,13 +215,20 @@ export class StatsWorkerHost implements StatsHost {
    * 连 aggregate 一起停，削核 CPU）；detail = 明细页有订阅（true 时 worker 才跨进程传全量明细）。
    */
   syncDemand(): void {
-    const connectionsStream =
-      this.opts.hasSubscribers('aggregate') || this.opts.hasSubscribers('detail');
+    const aggregate = this.opts.hasSubscribers('aggregate');
     const detail = this.opts.hasSubscribers('detail');
+    const history = this.opts.isHistoryEnabled?.() === true;
+    const connectionsStream = aggregate || detail || history;
     const prev = this.lastDemandSent;
-    if (!prev || prev.connectionsStream !== connectionsStream || prev.detail !== detail) {
-      this.lastDemandSent = { connectionsStream, detail };
-      this.post({ type: 'setDemand', connectionsStream, detail });
+    if (
+      !prev ||
+      prev.connectionsStream !== connectionsStream ||
+      prev.aggregate !== aggregate ||
+      prev.detail !== detail ||
+      prev.history !== history
+    ) {
+      this.lastDemandSent = { connectionsStream, aggregate, detail, history };
+      this.post({ type: 'setDemand', connectionsStream, aggregate, detail, history });
     }
   }
 
@@ -230,6 +262,10 @@ export class StatsWorkerHost implements StatsHost {
         this.connections = msg.payload;
         if (this.opts.isUiActive()) this.opts.onDetail(this.connections);
         break;
+      case 'history':
+        if (!this.started || this.opts.isHistoryEnabled?.() !== true) return;
+        this.opts.onHistory?.(msg.payload);
+        break;
     }
   }
 
@@ -238,6 +274,7 @@ export class StatsWorkerHost implements StatsHost {
   /** 代理就绪（api-client-ready）/ 切端口：让 worker 连最新端点并重订阅。worker 未 ready 时由 'ready' 握手补连。 */
   resubscribe(): void {
     this.started = true;
+    this.historySessionId = randomUUID();
     this.postConnect();
   }
 

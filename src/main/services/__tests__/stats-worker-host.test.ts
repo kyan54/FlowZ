@@ -71,7 +71,8 @@ function makeHost() {
   const onStats = jest.fn();
   const onAggregate = jest.fn();
   const onDetail = jest.fn();
-  const state = { active: true, endpoint: ENDPOINT as StatsApiEndpoint | null };
+  const onHistory = jest.fn();
+  const state = { active: true, history: false, endpoint: ENDPOINT as StatsApiEndpoint | null };
   // 订阅集（batch3 demand 源）：测试直接拨动，模拟 registry 订阅态；host.hasSubscribers 读它。
   const subs: Record<StatsTopic, boolean> = { stats: false, aggregate: false, detail: false };
   const host = new StatsWorkerHost({
@@ -79,11 +80,13 @@ function makeHost() {
     onStats,
     onAggregate,
     onDetail,
+    onHistory,
     isUiActive: () => state.active,
     hasSubscribers: (topic) => subs[topic],
+    isHistoryEnabled: () => state.history,
     getEndpoint: () => state.endpoint,
   });
-  return { host, onStats, onAggregate, onDetail, state, subs };
+  return { host, onStats, onAggregate, onDetail, onHistory, state, subs };
 }
 
 beforeEach(() => electron.__reset());
@@ -98,7 +101,13 @@ describe('StatsWorkerHost 控制面 (T4)', () => {
   it('resubscribe 下发最新端点 connect', () => {
     const { host } = makeHost();
     host.resubscribe();
-    expect(lastWorker().postMessage).toHaveBeenCalledWith({ type: 'connect', endpoint: ENDPOINT });
+    expect(lastWorker().postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'connect',
+        endpoint: ENDPOINT,
+        historySessionId: expect.any(String),
+      })
+    );
   });
 
   it('resubscribe 端点为 null（核未起）→ 下发 stop', () => {
@@ -151,6 +160,33 @@ describe('StatsWorkerHost 数据面门控 (T4)', () => {
     state.active = true;
     lastWorker().emit('message', { type: 'detail', payload: SAMPLE_CONNS });
     expect(onDetail).toHaveBeenCalledWith(SAMPLE_CONNS); // 可见 → relay 给连接页
+  });
+
+  it('history 消息仅在 started+开关开启时转交落盘回调', () => {
+    const { onHistory, host, state } = makeHost();
+    host.resubscribe();
+    const payload = [
+      {
+        key: 's:c',
+        sessionId: 's',
+        connectionId: 'c',
+        startedAt: 1,
+        observedAt: 1,
+        active: true,
+        chains: ['US'],
+        outbound: 'US',
+        upload: 0,
+        download: 0,
+      },
+    ];
+    lastWorker().emit('message', { type: 'history', payload });
+    expect(onHistory).not.toHaveBeenCalled();
+    state.history = true;
+    lastWorker().emit('message', { type: 'history', payload });
+    expect(onHistory).toHaveBeenCalledWith(payload);
+    host.stop();
+    lastWorker().emit('message', { type: 'history', payload });
+    expect(onHistory).toHaveBeenCalledTimes(1);
   });
 
   it('resume 活跃时补推缓存最新（stats+aggregate+detail）；不活跃不推', () => {
@@ -229,7 +265,9 @@ describe('StatsWorkerHost demand 由订阅集派生 (batch3 §3.7)', () => {
     expect(w.postMessage).toHaveBeenCalledWith({
       type: 'setDemand',
       connectionsStream: false,
+      aggregate: false,
       detail: false,
+      history: false,
     });
     w.postMessage.mockClear();
 
@@ -239,7 +277,9 @@ describe('StatsWorkerHost demand 由订阅集派生 (batch3 §3.7)', () => {
     expect(w.postMessage).toHaveBeenCalledWith({
       type: 'setDemand',
       connectionsStream: true,
+      aggregate: true,
       detail: false,
+      history: false,
     });
     w.postMessage.mockClear();
 
@@ -249,7 +289,9 @@ describe('StatsWorkerHost demand 由订阅集派生 (batch3 §3.7)', () => {
     expect(w.postMessage).toHaveBeenCalledWith({
       type: 'setDemand',
       connectionsStream: true,
+      aggregate: true,
       detail: true,
+      history: false,
     });
     w.postMessage.mockClear();
 
@@ -257,10 +299,17 @@ describe('StatsWorkerHost demand 由订阅集派生 (batch3 §3.7)', () => {
     w.emit('message', { type: 'stats', payload: SAMPLE_STATS });
     expect(w.postMessage).not.toHaveBeenCalled();
 
-    // aggregate 退订但 detail 仍在 → stream 由 detail 撑着，{true,true} 未变 → 不 post
+    // aggregate 退订但 detail 仍在 → stream 由 detail 撑着；aggregate demand 独立收口，需 post。
     subs.aggregate = false;
     host.syncDemand();
-    expect(w.postMessage).not.toHaveBeenCalled();
+    expect(w.postMessage).toHaveBeenCalledWith({
+      type: 'setDemand',
+      connectionsStream: true,
+      aggregate: false,
+      detail: true,
+      history: false,
+    });
+    w.postMessage.mockClear();
 
     // detail 也退订 → {stream:false, detail:false}
     subs.detail = false;
@@ -268,7 +317,25 @@ describe('StatsWorkerHost demand 由订阅集派生 (batch3 §3.7)', () => {
     expect(w.postMessage).toHaveBeenCalledWith({
       type: 'setDemand',
       connectionsStream: false,
+      aggregate: false,
       detail: false,
+      history: false,
+    });
+  });
+
+  it('history 开启时在无 UI 订阅下仍维持 Connections 流，但不开 aggregate/detail', () => {
+    const { host, state } = makeHost();
+    host.resubscribe();
+    const w = lastWorker();
+    w.postMessage.mockClear();
+    state.history = true;
+    host.syncDemand();
+    expect(w.postMessage).toHaveBeenCalledWith({
+      type: 'setDemand',
+      connectionsStream: true,
+      aggregate: false,
+      detail: false,
+      history: true,
     });
   });
 
@@ -285,7 +352,9 @@ describe('StatsWorkerHost demand 由订阅集派生 (batch3 §3.7)', () => {
     expect(w.postMessage).toHaveBeenCalledWith({
       type: 'setDemand',
       connectionsStream: true,
+      aggregate: true,
       detail: false,
+      history: false,
     }); // 按当前订阅（aggregate=true）重发
   });
 });
@@ -302,7 +371,9 @@ describe('StatsWorkerHost 生命周期 (T4)', () => {
     host.resubscribe(); // started=true，已发一次 connect
     lastWorker().postMessage.mockClear();
     lastWorker().emit('message', { type: 'ready' });
-    expect(lastWorker().postMessage).toHaveBeenCalledWith({ type: 'connect', endpoint: ENDPOINT });
+    expect(lastWorker().postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'connect', endpoint: ENDPOINT })
+    );
   });
 
   it('worker 崩溃 exit → 退避 respawn，新 worker ready 后自动重连', () => {
@@ -316,7 +387,9 @@ describe('StatsWorkerHost 生命周期 (T4)', () => {
     expect(workers()).toHaveLength(2);
 
     lastWorker().emit('message', { type: 'ready' }); // 新 worker 就绪
-    expect(lastWorker().postMessage).toHaveBeenCalledWith({ type: 'connect', endpoint: ENDPOINT });
+    expect(lastWorker().postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'connect', endpoint: ENDPOINT })
+    );
   });
 
   // Medium-B 回归：退避只该被「证明健康（发过 ready）」的 worker 重置；boot-即崩 worker 退避须持续增长。
