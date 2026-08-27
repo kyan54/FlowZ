@@ -16,11 +16,11 @@
 
 > 上游项目：https://github.com/dododook/FlowZ
 >
-> 定制维护：**上海营联信息技术有限公司**
+> 定制维护：[kyan54/FlowZ](https://github.com/kyan54/FlowZ)
 
-## 营联定制版
+## 定制版
 
-本仓库是基于 FlowZ 上游版本维护的营联定制发行版。版本号采用
+本仓库是基于 FlowZ 上游版本维护的定制发行版。版本号采用
 `<上游版本>-yl.<定制修订号>`：例如上游 `4.3.2` 对应首个定制版本
 `4.3.2-yl.1`；同步到上游 `4.3.3` 后，定制版本从 `4.3.3-yl.1` 重新计数。
 
@@ -29,7 +29,7 @@
 - 修复 macOS 系统代理 / 手动代理与 OpenVPN、EasyConnect 共存时，sing-box 错绑物理网卡导致的 `network is unreachable`。
 - 修复 macOS TUN 与 OpenVPN 共存时的同类出口冲突，并保留节点 IP 的 TUN 防回环排除。
 - 独立节点测速服从系统实际路由，可通过当前活动 VPN 出口测速。
-- GitHub Actions 在 `src/**` 发生变化并推送到 `main` 后自动执行 CI 和跨平台打包。
+- GitHub Actions 在每次推送到 `main` 后自动递增 `-yl.N` 版本，完成三平台打包并发布到 Releases。
 - 保留 VLESS + Reality + XTLS Vision 分享链接的直接导入与配置生成能力。
 
 主打：**配置简单 · 规则明确 · 切换不断流 · 一次授权零提权**。

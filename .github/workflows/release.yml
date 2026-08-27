@@ -1,15 +1,78 @@
 name: Release
 
+# main 每次推送都生成一个可见 Release；手动推 v* tag 仍可按指定版本发布。
+# main 路径以 package.json 的 x.y.z 为基线，查找远端 vX.Y.Z-yl.N 标签并自动 N+1；
+# 构建时临时写入该版本，不为了发版反向产生一个修改 package.json 的循环提交。
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+# 必须串行：后一次 main push 只有在前一次已创建 tag 后，才能安全计算下一个 yl.N。
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - name: Checkout code and tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#v}"
+          else
+            PACKAGE_VERSION=$(node -p "require('./package.json').version")
+            if [[ ! "$PACKAGE_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-yl\.[0-9]+)?$ ]]; then
+              echo "::error::package.json version '$PACKAGE_VERSION' 不是 x.y.z 或 x.y.z-yl.N"
+              exit 1
+            fi
+
+            BASE_VERSION="${BASH_REMATCH[1]}"
+            git fetch --tags --force
+            MAX_REVISION=0
+            while IFS= read -r EXISTING_TAG; do
+              REVISION="${EXISTING_TAG#v${BASE_VERSION}-yl.}"
+              if [[ "$REVISION" =~ ^[0-9]+$ ]] && (( 10#$REVISION > MAX_REVISION )); then
+                MAX_REVISION=$((10#$REVISION))
+              fi
+            done < <(git tag --list "v${BASE_VERSION}-yl.*")
+
+            VERSION="${BASE_VERSION}-yl.$((MAX_REVISION + 1))"
+            TAG="v${VERSION}"
+          fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::解析出的版本 '$VERSION' 不是合法 SemVer"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release version: $VERSION ($TAG)"
+
   release:
+    needs: prepare
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -33,123 +96,113 @@ jobs:
           node-version: '26'
           cache: 'npm'
 
-      # 提权 helper 二进制不入库（.gitignore），由 build:helper 现编现打：mac(helper/) + win(helper-win/)。
-      # 必须在 mac 与 win 两个 runner 都装 Go，否则该平台 package 缺 helper 二进制 → 安装提权助手「二进制缺失」(issue #57)。
-      - name: Setup Go (提权 helper, mac + win)
-        if: matrix.platform == 'mac' || matrix.platform == 'win'
+      # helper 二进制不入库，三平台都由 build:helper 现编现打。
+      - name: Setup Go (privileged helper)
         uses: actions/setup-go@v5
         with:
           go-version-file: helper/go.mod
           cache: false
 
-      - name: Install dependencies (Linux)
+      - name: Install packaging dependencies (Linux)
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y ruby-full build-essential
           sudo gem install --no-document fpm
 
+      # 普通 main push 不改写仓库版本；只在当次构建工作区内让应用版本/产物名与 Release 标签一致。
+      - name: Set build version
+        run: npm version "${{ needs.prepare.outputs.version }}" --no-git-tag-version --allow-same-version --ignore-scripts
+
       - name: Install dependencies
         env:
-          ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
+          ELECTRON_MIRROR: 'https://npmmirror.com/mirrors/electron/'
         run: npm ci
-
-      - name: Build application
-        run: npm run build
 
       - name: Package application
         run: npm run package:${{ matrix.platform }}
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
-          REQUIRE_HELPER: "1"
-          ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
-          ELECTRON_BUILDER_BINARIES_MIRROR: "https://npmmirror.com/mirrors/electron-builder-binaries/"
+          REQUIRE_HELPER: '1'
+          ELECTRON_MIRROR: 'https://npmmirror.com/mirrors/electron/'
+          ELECTRON_BUILDER_BINARIES_MIRROR: 'https://npmmirror.com/mirrors/electron-builder-binaries/'
 
       - name: Create DMG (macOS, arm64 + x64)
         if: matrix.platform == 'mac'
+        shell: bash
         run: |
-          # electron-builder.json mac.target.arch = [arm64, x64] → 两个架构的 .app 都已构建，但
-          # 多架构下 electron-builder 会把其中一个架构放进【无后缀】的 dist-package/mac/
-          # （v4.1.0 实测：x64 落 dist-package/mac、arm64 落 dist-package/mac-arm64），各自含对应架构的提权 helper。
-          # 故此处按 arch 后缀目录优先、回退无后缀目录，并用 lipo 校验确属目标架构；缺则【报错失败】（不再静默跳过，
-          # 避免 v4.1.0 那样绿灯却漏发 mac-x64 包）。
-          VERSION=${GITHUB_REF#refs/tags/v}
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
           for ARCH in arm64 x64; do
             DMG_PATH="dist-package/FlowZ-${VERSION}-mac-${ARCH}.dmg"
             case "$ARCH" in arm64) WANT=arm64 ;; x64) WANT=x86_64 ;; esac
             APP_PATH=""
             for CAND in "dist-package/mac-${ARCH}/FlowZ.app" "dist-package/mac/FlowZ.app"; do
               [ -d "$CAND" ] || continue
-              EXE=$(ls "$CAND"/Contents/MacOS/* 2>/dev/null | head -1)
-              if [ -n "$EXE" ] && lipo -archs "$EXE" 2>/dev/null | tr ' ' '\n' | grep -qx "$WANT"; then
-                APP_PATH="$CAND"; break
+              EXE=$(find "$CAND/Contents/MacOS" -maxdepth 1 -type f -print -quit)
+              if [ -n "$EXE" ] && lipo -archs "$EXE" | tr ' ' '\n' | grep -qx "$WANT"; then
+                APP_PATH="$CAND"
+                break
               fi
             done
             if [ -z "$APP_PATH" ]; then
-              echo "::error::找不到 ${ARCH}(${WANT}) 架构的 FlowZ.app（查了 dist-package/mac-${ARCH}/ 与 dist-package/mac/）——发布将缺 mac-${ARCH} 包，请检查 package:mac 的 electron-builder --${ARCH} 产出。"
+              echo "::error::找不到 ${ARCH}(${WANT}) 架构的 FlowZ.app"
               exit 1
             fi
-            echo "Using ${ARCH} app bundle: $APP_PATH"
-            echo "Ad-hoc deep signing ${ARCH} app bundle (fix Team ID mismatch)..."
-            codesign --force --deep --sign - "$APP_PATH"
 
-            echo "Creating ${ARCH} DMG..."
+            codesign --force --deep --sign - "$APP_PATH"
+            codesign --verify --deep --strict "$APP_PATH"
+
             TEMP_DIR=$(mktemp -d)
-            cp -R "$APP_PATH" "$TEMP_DIR/"
+            trap 'rm -rf "$TEMP_DIR"' EXIT
+            cp -R "$APP_PATH" "$TEMP_DIR/FlowZ.app"
             ln -s /Applications "$TEMP_DIR/Applications"
-            # ad-hoc 签名（无付费 Developer ID/公证）→ 从下载的 DMG 拖出的 app 带 quarantine，
-            # macOS 首次打开报「已损坏，应移到废纸篓」，且右键→打开无效、须 xattr -cr。
-            # DMG 内附首次打开引导（中英），教用户清除隔离属性。文件名带序号让它排在 app 前、更显眼。
             cp "build/macos-dmg-open-guide.txt" "$TEMP_DIR/0 首次打开必读 READ ME FIRST.txt"
             hdiutil create -volname "FlowZ ${VERSION} (${ARCH})" \
               -srcfolder "$TEMP_DIR" \
               -ov -format UDZO \
               "$DMG_PATH"
             rm -rf "$TEMP_DIR"
+            trap - EXIT
             echo "Created: $DMG_PATH"
           done
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.platform }}
+          name: release-${{ needs.prepare.outputs.version }}-${{ matrix.platform }}
           path: |
             dist-package/*.exe
             dist-package/*.dmg
             dist-package/*.AppImage
             dist-package/*.deb
+          if-no-files-found: error
           retention-days: 5
 
   create-release:
-    needs: release
+    needs: [prepare, release]
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Display structure of downloaded files
-        run: ls -R artifacts
+      - name: Display downloaded files
+        run: find artifacts -maxdepth 3 -type f -print
 
-      - name: Extract version from tag
-        id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
-      - name: Create GitHub Release
-        # Release notes 单一来源：generate_release_notes 由 GitHub 自动从 PR 列表生成「## What's Changed」+
-        # Full Changelog。不再额外注入 body（曾与 generate_release_notes 叠加导致两个 ## What's Changed 且
-        # 与 PR 标题重复）；无需维护 CHANGELOG.md。
+      - name: Create public GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: Release ${{ steps.version.outputs.VERSION }}
-          draft: true
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Release ${{ needs.prepare.outputs.version }}
+          draft: false
           prerelease: false
+          make_latest: true
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             artifacts/**/*.exe
             artifacts/**/*.dmg
