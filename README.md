@@ -26,11 +26,12 @@
 
 当前定制改动：
 
-- 修复 macOS 系统代理 / 手动代理与 OpenVPN、EasyConnect 共存时，sing-box 错绑物理网卡导致的 `network is unreachable`。
-- 修复 macOS TUN 与 OpenVPN 共存时的同类出口冲突，并保留节点 IP 的 TUN 防回环排除。
-- 独立节点测速服从系统实际路由，可通过当前活动 VPN 出口测速。
-- GitHub Actions 在每次推送到 `main` 后自动递增 `-yl.N` 版本，完成三平台打包并发布到 Releases。
-- 保留 VLESS + Reality + XTLS Vision 分享链接的直接导入与配置生成能力。
+- **macOS VPN 路由兼容**：系统代理 / 手动代理、独立节点测速均服从系统对目标地址的实际路由，避免与 OpenVPN、EasyConnect 共存时错绑物理网卡导致 `network is unreachable`。
+- **macOS TUN 动态选择上游接口**：启动前按已选节点和已启用规则的实际目标路由选择 VPN 接口，保留 TUN 防回环；VPN 连接、断开或上游接口变化时会重新检测并受控重连 FlowZ。
+- **进程规则自动回显**：重新打开「从进程选择」时，已保存的进程名或完整路径会自动勾选；支持取消旧选项，也不会丢失未运行或当前被隐藏的已保存进程。
+- **macOS 中文进程路径**：修复进程选择器中中文应用名和 `/Applications/...` 可执行路径显示为 `M-fM-...` 的乱码问题。
+- **VLESS + Reality + XTLS Vision**：保留分享链接的直接导入与 sing-box 配置生成能力。
+- **自动发布**：每次推送到 `main` 后，GitHub Actions 自动递增 `-yl.N` 版本，构建 Windows、macOS arm64/x64 和 Linux 安装包，并发布到 Releases。
 
 主打：**配置简单 · 规则明确 · 切换不断流 · 一次授权零提权**。
 
