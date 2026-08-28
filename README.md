@@ -298,4 +298,4 @@ MIT License
 
 ## ⭐ Star 趋势
 
-[![Star History Chart](https://api.star-history.com/svg?repos=kyan54/FlowZ&type=Date)](https://star-history.com/#kyan54/FlowZ&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=kyan54/FlowZ&type=Date)](https://star-history.dera.page/#kyan54/FlowZ&Date)

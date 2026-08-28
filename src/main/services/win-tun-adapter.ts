@@ -6,12 +6,13 @@
  *
  * 设计要点：
  *  - 设备级、按名匹配（非按地址）：杜绝与外部 sing-box / 用户手动核 / 自家孤儿核的同址网卡混淆。
- *  - 零提权：Get-NetAdapter 普通用户即可查。
+ *  - 零提权：netsh 只读查询（存在性）与 Get-NetIPAddress（地址占用）普通用户即可跑。
  *  - fail-open：探测失败 / 超时仍在 → 放行启动（绝不卡死代理），残留由启动 retry 兜底。
  *  - 纯逻辑 waitForAdapterReleased 注入 probe/sleep，便于无真实计时器/无真实网卡的单测。
  */
 import { execFile } from 'child_process';
-import { powershellPath } from '../utils/win-system32';
+import * as os from 'os';
+import { powershellPath, system32 } from '../utils/win-system32';
 import type { AddressUsage } from '../../shared/tun-address';
 
 /** 哨兵首行：脚本跑到这一行 == 探测链路可用（cmdlet 存在、模块加载成功、PS 未被拦）。 */
@@ -48,8 +49,16 @@ interface PsProbeResult {
  *   地址空闲 / 网卡不存在 → `ObjectNotFound`（`CmdletizationQuery_NotFound_*`）；CIM 会话不可用 → `ResourceUnavailable`。
  * 故哨兵的发放条件是「零错误，或被吞的错误**全部**是 ObjectNotFound」。
  *
- * 脚本经 `-EncodedCommand`（UTF-16LE base64）传入，消掉命令行层的转义面；PowerShell 语法层仍靠调用方的
- * 单引号转义 + 输入校验（IP 正则 / 网卡名字符集）把关。
+ * 脚本作为**单个 argv 元素**经 `-Command` 传入：`execFile` 不过 shell，argv 边界即转义边界，故命令行层没有
+ * 可注入面；PowerShell 语法层仍靠调用方的单引号转义 + 输入校验（IP 正则 / 网卡名字符集）把关。
+ *
+ * **为什么不是 `-EncodedCommand`**（原实现，2026-08-26 真机实测推翻）：base64 编码的 PowerShell 是恶意脚本的
+ * 典型形态，杀软要在进程创建回调里深扫，于是 `execFile` 的 `CreateProcessW` **同步阻塞主线程**。Windows 11
+ * 26200 实测，同一段脚本只换传参方式（每次插 nonce 保证内容都是冷的，排除按哈希缓存）：
+ *   `-EncodedCommand` 同步段 2298 / 2328 / 2336 / 4729 ms；`-Command` 同步段 8.2 / 8.3 / 8.5 / 9.9 ms。
+ * 这不是延迟而是**主进程冻结**——起核路径上两次探测的同步段合计 ~7.2s，占一次 TUN 冷启（12.1s）的六成，
+ * 期间 UI 完全无响应，且任何「并行预热」都吃不掉它（B1 只兑现 130ms 的真因）。编码传参消掉的那层命令行
+ * 转义面，由「脚本是单个 argv 元素」这条性质等价提供，故换回明文**不放宽任何输入约束**。
  *
  * **stdout 只可用来比对 ASCII**：中文 Windows 的 PowerShell 按 OEM codepage（936）写 stdout，Node execFile
  * 默认按 utf8 解码 → 非 ASCII 输出必成乱码（真机实测：网卡名「以太网」回传即乱码）。本模块的比对对象全是
@@ -69,11 +78,10 @@ function runPsProbe(pipeline: string): Promise<PsProbeResult> {
     `} catch { }`,
     `exit 0`,
   ].join('\n');
-  const encoded = Buffer.from(script, 'utf16le').toString('base64');
   return new Promise((resolve) => {
     execFile(
       powershellPath(),
-      ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+      ['-NoProfile', '-NonInteractive', '-Command', script],
       { timeout: 4000, windowsHide: true },
       (err, stdout) => {
         if (err) return resolve({ ok: false, lines: [] });
@@ -91,6 +99,58 @@ function runPsProbe(pipeline: string): Promise<PsProbeResult> {
 }
 
 /**
+ * F2：跑一条 netsh 只读查询。**只用于设备级存在性**，不用于地址占用（理由见 probeWinIpv4AddressUsage 头注）。
+ *
+ * 为什么值得单开一条路：netsh 是原生工具，不过 PowerShell、不进 AMSI，真机实测 66–71ms，而同结论的
+ * PowerShell 探测要 713–1005ms（`-Command` 明文；`-EncodedCommand` 更是每次 2.3–4.7s 的主进程同步冻结）。
+ * #159 释放门在**真正需要等**的时候是每秒一探、最多 24 轮——那正是这条路差价最大的场景。
+ *
+ * 「查询确实跑过」的哨兵：netsh 的表头分隔线（一整行连续 `-`）。它**与语言无关**——中文 Windows 上表头
+ * 文字是本地化的，这行不是。exit code 只用来兜真正的执行失败（netsh 缺失 / 被拦 / 超时）。
+ *
+ * **stdout 只可用来比对 ASCII**：中文 Windows 的 netsh 按 OEM codepage(936) 写 stdout，Node 按 utf8 解码
+ * 必成乱码。本函数的比对对象只有分隔线与受 `^[A-Za-z0-9_-]{1,32}$` 约束的自家网卡名，二者皆 ASCII。
+ */
+function runNetshProbe(args: string[]): Promise<PsProbeResult> {
+  return new Promise((resolve) => {
+    execFile(system32('netsh.exe'), args, { timeout: 4000, windowsHide: true }, (err, stdout) => {
+      if (err) return resolve({ ok: false, lines: [] });
+      const lines = String(stdout)
+        .split(/\r?\n/)
+        .map((l) => l.trimEnd())
+        .filter((l) => l.trim().length > 0);
+      // 无分隔线 = 表根本没产出（被拦 / 输出截断 / 换了输出形态）→ 按探测失败处理，绝不当成「查询为空」。
+      if (!lines.some((l) => /^-{10,}$/.test(l.trim()))) return resolve({ ok: false, lines: [] });
+      resolve({ ok: true, lines });
+    });
+  });
+}
+
+/**
+ * 从 `netsh interface show interface` 的表里判断本名接口在不在。
+ *
+ * 判据：netsh 的列是**空白对齐**的，接口名在最后一列，故按 `\s{2,}` 切出的最后一个字段即接口名全称。
+ * 这一点比「最后一个空白分隔 token」强：后者会把名为 `VPN flowz-tun0` 的**别的**网卡误判成本名命中
+ * （`Get-NetAdapter -Name` 是精确匹配，不会）。
+ *
+ * **含糊时降级为 unknown，绝不降级为 absent**：若某行以子串形式含本名、却切不出干净字段（列间只隔了
+ * 一个空格等没吃准的排版），返回 `unknown`。因为对 issue #324 的正向就绪门来说，假 `absent` 会走到
+ * `absent-timeout` → 硬闸 → 「持续性 TUN 失败」永久拒连，是**最贵**的误判方向；`unknown` 则 fail-open。
+ */
+function matchNetshInterfaceName(lines: string[], name: string): AdapterPresence {
+  let ambiguous = false;
+  for (const line of lines) {
+    const fields = line
+      .trim()
+      .split(/\s{2,}/)
+      .filter((f) => f.length > 0);
+    if (fields.length > 0 && fields[fields.length - 1] === name) return 'present';
+    if (line.includes(name)) ambiguous = true;
+  }
+  return ambiguous ? 'unknown' : 'absent';
+}
+
+/**
  * 探测 Windows 上是否仍存在名为 `name` 的网卡（设备级，零提权）。#159 反向释放门用。
  * 命中 → true；查不到 / PowerShell 失败 / 超时 → false（宁判「已释放」放行，绝不卡死启动）。
  * 委托三态版 `probeWinTunAdapterPresence`（单一 Get-NetAdapter 实现，杜绝两处漂移，issue #324 review Low#3）：
@@ -104,6 +164,8 @@ export function probeWinTunAdapterPresent(name: string): Promise<boolean> {
 export interface AdapterWaitDeps {
   probe: (name: string) => Promise<boolean>;
   sleep: (ms: number) => Promise<void>;
+  /** 单调毫秒时钟，缺省 `Date.now`（把 timeoutMs 落成真的时间预算，见 waitForAdapterReleased 头注）。 */
+  now?: () => number;
 }
 
 /** 等待结果：released=true 已确认网卡消失；false=超时仍在（调用方放行交 retry）。polls=实际探测次数。 */
@@ -114,7 +176,11 @@ export interface AdapterWaitResult {
 
 /**
  * 有界轮询等名为 `name` 的网卡消失。早退：一旦探测到消失立即返回。
- * maxPolls = ceil(timeoutMs/pollMs)，每轮 probe→（仍在则）sleep；循环末再 probe 一次覆盖最后窗口。
+ * 每轮 probe→（仍在则）sleep；循环末再 probe 一次覆盖最后窗口。
+ *
+ * **预算是时间不是轮数**：`maxPolls = ceil(timeoutMs/pollMs)` 隐含「每轮成本 ≈ pollMs」，而这里的 probe 是
+ * PowerShell（真机实测单次 ~950ms）→ 8000/500 名义 8s，真实墙钟 17×0.95+16×0.5 ≈ **24s**（复审实测）。
+ * 故以单调时钟 deadline 为主判据，maxPolls 退居兜底（时钟不前进的注入式单测走这条，行为与改动前逐字相同）。
  */
 export async function waitForAdapterReleased(
   name: string,
@@ -123,7 +189,9 @@ export async function waitForAdapterReleased(
 ): Promise<AdapterWaitResult> {
   const pollMs = Math.max(1, opts.pollMs);
   const maxPolls = Math.max(1, Math.ceil(opts.timeoutMs / pollMs));
-  for (let i = 0; i < maxPolls; i++) {
+  const now = deps.now ?? Date.now;
+  const deadline = now() + opts.timeoutMs;
+  for (let i = 0; i < maxPolls && now() < deadline; i++) {
     if (!(await deps.probe(name))) return { released: true, polls: i + 1 };
     await deps.sleep(pollMs);
   }
@@ -147,18 +215,49 @@ export async function waitForAdapterReleased(
 export type AdapterPresence = 'present' | 'absent' | 'unknown';
 
 /**
+ * B3 零 spawn 快检：Node 的接口枚举里是否有本名接口。
+ *
+ * **只允许产出肯定结论**——这是本函数唯一的设计约束，也是它敢在没有 Windows 真机的情况下上线的全部理由：
+ *  - 看见 → `true`，可直接判 present（Node 枚举的是 `GetAdaptersAddresses` 的 FriendlyName，与 `Get-NetAdapter -Name`
+ *    同一个名字空间；能看见就是真的存在）。
+ *  - 看不见 → `false`，含义是**「本法说不了」而不是「不存在」**，调用方一律回落 PowerShell 由它给权威结论。
+ *
+ * 为什么不能反过来用它判 absent（issue #324 §5.6 的教训）：libuv 只返回**带地址**的接口，
+ * 而 #159 要等的那种硬杀后滞留的 wintun 网卡、以及 #324 的冲突源 TAP 残留网卡，恰恰常处于 Disconnected/无地址态
+ * ——Node 看不见它们。据此判 absent 会让 #159 释放门恒放行、#324 正向门把健康机器判成「TUN 从未创建」的终态失败。
+ *
+ * 最坏情况（Node 在某些 Windows 版本上压根看不见 wintun 适配器）：本函数恒 false → 行为与改动前逐字相同，
+ * 只是省不到那次 spawn。**没有产生假 absent 的路径**，故不需要 Windows 真机才能上线。
+ *
+ * @param list 注入点（单测用）；缺省读 `os.networkInterfaces()`。
+ */
+export function nodeSeesInterface(
+  name: string,
+  list?: ReturnType<typeof os.networkInterfaces>
+): boolean {
+  if (!name) return false;
+  try {
+    const map = list ?? os.networkInterfaces();
+    const entry = map[name];
+    // 键存在但值为 undefined/空数组 → 当作没看见（无地址的接口不构成肯定结论）。
+    return Array.isArray(entry) && entry.length > 0;
+  } catch {
+    return false; // 枚举本身失败 → 说不了，交回 PowerShell
+  }
+}
+
+/**
  * 三态探测名为 `name` 的网卡是否存在（issue #324）。与 probeWinTunAdapterPresent 同一 Get-NetAdapter 机制，
  * 仅返回值语义更细：err（spawn/执行失败）→ 'unknown'；命中本名 → 'present'；查询成功但空 → 'absent'。
  */
 export function probeWinTunAdapterPresence(name: string): Promise<AdapterPresence> {
-  const psName = name.replace(/'/g, "''");
-  // 哨兵在、命中本名 → present；哨兵在、无命中 → absent（查询确实跑过，可据此判「从未创建」）；
-  // 哨兵不在 → unknown（fail-open）。见 runPsProbe 头注：退出码不再参与「空结果」判定。
-  return runPsProbe(
-    `Get-NetAdapter -Name '${psName}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name`
-  ).then((r) => {
+  // B3 快路径：Node 看得见本名接口 → 直接 'present'，省掉一次外部进程。
+  if (nodeSeesInterface(name)) return Promise.resolve('present');
+  // F2：设备级存在性改走 netsh（真机实测 66–71ms，PowerShell 同结论要 713–1005ms）。三态语义与
+  //   `Get-NetAdapter -Name <名>` 在真机上逐态对齐过（未起=absent / 已起=present / 停止后=absent）。
+  return runNetshProbe(['interface', 'show', 'interface']).then((r) => {
     if (!r.ok) return 'unknown';
-    return r.lines.some((line) => line === name) ? 'present' : 'absent';
+    return matchNetshInterfaceName(r.lines, name);
   });
 }
 
@@ -166,6 +265,8 @@ export function probeWinTunAdapterPresence(name: string): Promise<AdapterPresenc
 export interface AdapterPresenceWaitDeps {
   probe: (name: string) => Promise<AdapterPresence>;
   sleep: (ms: number) => Promise<void>;
+  /** 单调毫秒时钟，缺省 `Date.now`（把 timeoutMs 落成真的时间预算，见 waitForAdapterPresent 头注）。 */
+  now?: () => number;
   /**
    * issue #176/#324 High#1：本腿是否已被更新的 start/stop 接管（可选；缺省视作未接管）。每轮先判——接管后本腿继续
    * 验适配器/停核/发 started 都会抢放接管方的核，故立即让位（outcome='superseded'），调用方绝不 stopCore/emit started。
@@ -199,6 +300,12 @@ export async function waitForAdapterPresent(
 ): Promise<AdapterPresentResult> {
   const pollMs = Math.max(1, opts.pollMs);
   const maxPolls = Math.max(1, Math.ceil(opts.timeoutMs / pollMs));
+  // 与 waitForAdapterReleased 同一条纪律（**姊妹腿，同根因一起改**）：8000/1000 名义 8s，probe 为 PowerShell 时
+  //   真实墙钟 8×(0.95+1.0)+0.95 ≈ **16.6s**。这条腿的形态更糟——它是 #324 的硬闸，判 absent-timeout 要先耗完
+  //   整个预算，三腿耗尽的路径上光这个门就吃掉 ~50s。B3 快检只在**真 present** 时救得了它；真出故障那条路上
+  //   Node 恒看不见，每轮都得付 PowerShell，正是最需要预算准确的场景。
+  const now = deps.now ?? Date.now;
+  const deadline = now() + opts.timeoutMs;
   // 一次 clean absent 即证明 Get-NetAdapter 探测链路可用；据此把「确实没建起」（→ 硬闸/终态）与「探测本身失败」
   // （全 unknown → fail-open）区分开。零星 unknown 被一次 clean absent 压过。
   let sawAbsent = false;
@@ -209,7 +316,7 @@ export async function waitForAdapterPresent(
       return 'unknown'; // probe 抛错 → fail-open（按 unknown 处理，绝不据此判失败）
     }
   };
-  for (let i = 0; i < maxPolls; i++) {
+  for (let i = 0; i < maxPolls && now() < deadline; i++) {
     if (deps.isSuperseded?.()) return { outcome: 'superseded', polls: i }; // #176：接管先于一切，立即让位
     const p = await step();
     if (p === 'present') return { outcome: 'present', polls: i + 1 };
@@ -277,6 +384,12 @@ export function probeWinIpv4AddressUsage(
   ip: string,
   excludeInterfaceAlias?: string
 ): Promise<AddressUsage> {
+  // F2 **不覆盖本函数**（存在性探测已改 netsh，地址占用留在 PowerShell）。理由：`Get-NetIPAddress` 被选中
+  //   正是因为它看得见 **Disconnected 适配器**上的地址——#324 的冲突源就是那种。netsh 的
+  //   `interface ipv4 show ipaddresses` 默认只列活动接口，`store=persistent` 又是另一套语义（持久配置，
+  //   漏 DHCP 下发），两者都不等价。而「等价」这件事在手上这台真机**无法取证**：它只有一张网卡，
+  //   造一张 Disconnected 适配器就得动网卡=动控制通道。没有取证就不换判据——省下的那几百毫秒
+  //   （且不在关键路径上，实测 `tunAddrPreflightWait` 多数轮为 0）不值这个风险。
   // 纵深防御：调用方只传候选池常量，但仍拒绝非法字面量（PowerShell 命令拼接面）。
   if (!/^[0-9]{1,3}(\.[0-9]{1,3}){3}$/.test(ip)) return Promise.resolve('unknown');
   // **必须排除自家 TUN 接口**：预检跑在 startInternal，**早于** #159 的适配器释放门（在 startSingBoxProcess

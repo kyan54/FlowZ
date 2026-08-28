@@ -198,6 +198,26 @@ describe('buildDiagnosticReport', () => {
     singboxLogTail: '',
   };
 
+  /**
+   * B0：起核阶段耗时汇总行必须真的出现在报告里。整条链路（`DiagnosticService` 喂字段 → 本函数渲染）此前
+   * 零判据——复审实测把渲染块和接线各自删掉都全绿，而「真机跑一次就能从诊断报告读到分阶段分布」正是本批的
+   * 完成标准，全押在这条无门链路上。
+   */
+  it('runtime.lastStartTimeline 必须渲染进报告（B0 完成标准所系）', () => {
+    const line = '起核阶段耗时 total=8421ms outcome=ok | killOrphans=181 L1.coreReady:ready=2311';
+    const md = buildDiagnosticReport({
+      ...base,
+      runtime: { ...base.runtime, lastStartTimeline: line },
+    });
+    // 变异守卫：删掉 diagnostic-redact 里那三行渲染 → 红
+    expect(md).toContain(line);
+  });
+
+  it('未启动过（字段缺席）时不产出空行/占位符', () => {
+    const md = buildDiagnosticReport(base);
+    expect(md).not.toContain('起核阶段耗时');
+  });
+
   it('含核心区块与脱敏 JSON', () => {
     const md = buildDiagnosticReport(base);
     expect(md).toContain('# FlowZ 诊断报告');
@@ -211,6 +231,66 @@ describe('buildDiagnosticReport', () => {
   it('空日志 tail 渲染为占位「(空)」', () => {
     const md = buildDiagnosticReport(base);
     expect(md).toContain('(空)');
+  });
+
+  // issue #367：这四条渲染分支是「刷新到底有没有发生过」的用户可见半段。判断顺序若写反
+  //（先 ok 后 skipped），skipped 会被渲染成「成功」——正是本批要消灭的那类误读，且不会有任何红。
+  describe('系统 DNS 缓存刷新段（issue #367）', () => {
+    const withFlush = (f: NonNullable<DiagnosticReportInput['runtime']['lastDnsFlush']>) =>
+      buildDiagnosticReport({ ...base, runtime: { ...base.runtime, lastDnsFlush: f } });
+
+    it('缺省 → 「本会话从未触发」（缺省本身即信息，如核从未成功起过）', () => {
+      expect(buildDiagnosticReport(base)).toContain('本会话从未触发');
+    });
+
+    it('成功 → 含 context / 年龄 / detail', () => {
+      const md = withFlush({
+        ok: true,
+        detail: 'resolvectl flush-caches',
+        context: 'start',
+        ageSec: 12,
+      });
+      expect(md).toContain('系统 DNS 缓存刷新：成功（start，12s 前，resolvectl flush-caches）');
+    });
+
+    it('失败 → 标「失败」+ 分类 + detail（**不得**出现「成功」字样）', () => {
+      const md = withFlush({
+        ok: false,
+        reason: 'permission-denied',
+        detail: 'Interactive authentication required.（授权规则可能未安装）',
+        context: 'link-change',
+        ageSec: 3,
+      });
+      expect(md).toContain('**失败**');
+      expect(md).toContain('permission-denied');
+      expect(md).toContain('Interactive authentication required.');
+      expect(md).not.toContain('系统 DNS 缓存刷新：成功');
+    });
+
+    it('skipped → 标「已跳过」，**不得**渲染成成功（skipped ≠ 刷新成功）', () => {
+      const md = withFlush({
+        ok: true,
+        skipped: true,
+        detail: '平台 freebsd 无 DNS 缓存刷新机制，已跳过',
+        context: 'start',
+        ageSec: 1,
+      });
+      expect(md).toContain('已跳过');
+      expect(md).not.toContain('系统 DNS 缓存刷新：成功');
+    });
+
+    it('partial（macOS HUP 失败）→ 标「部分成功」，**不得**与真成功同 headline', () => {
+      const md = withFlush({
+        ok: true,
+        detail: 'helper root（dscacheutil 已成功，HUP mDNSResponder 失败）',
+        partial: 'killall-hup exit status 1',
+        context: 'stop',
+        ageSec: 5,
+      });
+      expect(md).toContain('**部分成功**');
+      expect(md).toContain('killall-hup exit status 1');
+      expect(md).not.toContain('系统 DNS 缓存刷新：成功');
+    });
   });
 
   it('有 startupLogTail 时渲染核启动日志区块（issue #324 诊断盲区）', () => {
