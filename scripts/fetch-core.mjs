@@ -53,6 +53,20 @@ const SHA = manifest.coreArchiveSha256 || {}; // 压缩包 sha == 官方 release
 const BIN_SHA = manifest.coreBinarySha256 || {};
 const REPO = 'SagerNet/sing-box';
 const FORCE = process.argv.includes('--force');
+// GitHub Release 会重定向到 objects.githubusercontent.com；跨 host 下载偶发 ECONNRESET/TLS reset。
+// curl 的普通 --retry 默认不覆盖所有传输错误，须显式 --retry-all-errors，否则 runner 会在第一次
+// connection reset 后直接失败。总时限同时防止异常网络下无限挂起。
+const CURL_RETRY_ARGS = [
+  '--retry',
+  '5',
+  '--retry-all-errors',
+  '--retry-delay',
+  '2',
+  '--connect-timeout',
+  '15',
+  '--max-time',
+  '600',
+];
 
 // resources 目标目录 ← 官方资产名(压缩包) → 落地二进制名 → coreArchiveSha256 key。
 // 官方资产解出单一顶层目录 sing-box-${VERSION}-${os}-${arch}/，内含 sing-box[.exe]（+ LICENSE；
@@ -139,8 +153,11 @@ for (const t of TARGETS) {
   try {
     const archive = join(work, t.asset);
     console.log(`downloading ${t.asset} ...`);
-    // -fL：失败返回非零（不把 404 页面当成功）+ 跟随重定向(release → objects.githubusercontent)；--retry 抗瞬时抖动。
-    execFileSync('curl', ['-fL', '--retry', '3', '-o', archive, url], { stdio: 'inherit' });
+    // -fL：失败返回非零（不把 404 页面当成功）+ 跟随重定向(release → objects.githubusercontent)；
+    // retry-all-errors 覆盖 CI 实际出现的 connection reset/TLS reset，下载后仍必须通过双层 sha pin。
+    execFileSync('curl', ['-fL', ...CURL_RETRY_ARGS, '-o', archive, url], {
+      stdio: 'inherit',
+    });
 
     // 完整性校验：对下载的压缩包本体算 sha256，比对 manifest pin（= 官方 API asset digest）。fail-fast 于解压前。
     const got = sha256(archive);
